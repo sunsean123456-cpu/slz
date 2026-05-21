@@ -17,7 +17,7 @@ from contextlib import asynccontextmanager
 # 导入配置
 from app.config import settings
 from app.database import engine, Base
-from app.routers import data, policy, health, plan, auth, files, ai
+from app.routers import data, policy, health, plan, pricing, auth, files, ai
 
 # 配置日志
 logging.basicConfig(level=logging.INFO)
@@ -76,6 +76,7 @@ app.include_router(data.router, prefix="/api/data", tags=["社区达人"])
 app.include_router(policy.router, prefix="/api/policy", tags=["政策咨询"])
 app.include_router(health.router, prefix="/api/health", tags=["城市体检"])
 app.include_router(plan.router, prefix="/api/plan", tags=["方案评审"])
+app.include_router(pricing.router, prefix="/api/pricing", tags=["收费/会员"])
 app.include_router(ai.router, prefix="/api/ai", tags=["AI 服务"])
 
 
