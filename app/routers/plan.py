@@ -1,262 +1,269 @@
 """
-方案评审路由
+方案评审路由 - 真实 AI 评审
 """
-import json
-from fastapi import APIRouter, Depends, HTTPException, status
+import os
+import uuid
+from fastapi import APIRouter, UploadFile, File, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
 from app.database import get_db
 from app.models.plan_review import PlanReview
 from app.schemas.plan import PlanReviewCreate, PlanReviewResponse
-from app.schemas.multimodal import MultimodalInput
-from app.services.ai_service import ai_service
+from app.services.review_engine import review_engine
+from app.services.document_parser import document_parser
+from app.config import settings
 import logging
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
+# 上传目录
+UPLOAD_DIR = settings.UPLOAD_DIR
+os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-@router.post("/", response_model=PlanReviewResponse)
-async def create_plan_review(
-    data: PlanReviewCreate,
+
+@router.post("/upload")
+async def upload_plan(
+    file: UploadFile = File(...),
     db: AsyncSession = Depends(get_db)
 ):
     """
-    创建方案评审
+    上传方案文件
+    支持：PDF/Word/Excel
     """
     try:
+        # 生成文件名
+        file_ext = file.filename.split(".")[-1] if "." in file.filename else ""
+        unique_name = f"{uuid.uuid4().hex}.{file_ext}"
+        file_path = os.path.join(UPLOAD_DIR, unique_name)
+        
+        # 保存文件
+        content = await file.read()
+        with open(file_path, "wb") as f:
+            f.write(content)
+        
+        # 检测文件类型
+        file_type = document_parser.detect_file_type(file.filename)
+        
+        # 创建评审记录
         review = PlanReview(
-            project_id=data.project_id,
-            title=data.title
+            title=file.filename,
+            status="uploading",
+            file_name=unique_name,
+            file_path=file_path,
+            file_type=file_type
         )
         db.add(review)
         await db.commit()
         await db.refresh(review)
         
-        return review
+        return {
+            "success": True,
+            "review_id": review.id,
+            "file_name": unique_name,
+            "file_type": file_type
+        }
     except Exception as e:
-        logger.error(f"创建方案评审失败：{str(e)}")
+        logger.error(f"文件上传失败：{str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.get("/", response_model=list[PlanReviewResponse])
-async def list_plan_reviews(
-    project_id: int = None,
-    status: str = None,
-    skip: int = 0,
-    limit: int = 100,
+@router.post("/{review_id}/parse")
+async def parse_plan(
+    review_id: int,
     db: AsyncSession = Depends(get_db)
 ):
     """
-    查询方案评审列表
+    解析方案文件
     """
-    query = select(PlanReview)
-    
-    if project_id:
-        query = query.where(PlanReview.project_id == project_id)
-    if status:
-        query = query.where(PlanReview.status == status)
-    
-    query = query.offset(skip).limit(limit)
-    
-    result = await db.execute(query)
-    reviews = result.scalars().all()
-    
-    return reviews
-
-
-@router.get("/{review_id}", response_model=PlanReviewResponse)
-async def get_plan_review(review_id: int, db: AsyncSession = Depends(get_db)):
-    """获取方案评审详情"""
+    # 获取评审记录
     result = await db.execute(
         PlanReview.__table__.select().where(PlanReview.id == review_id)
     )
     review = result.first()
     
     if not review:
-        raise HTTPException(status_code=404, detail="方案评审不存在")
+        raise HTTPException(status_code=404, detail="评审记录不存在")
     
-    return review
-
-
-@router.delete("/{review_id}")
-async def delete_plan_review(review_id: int, db: AsyncSession = Depends(get_db)):
-    """删除方案评审"""
-    result = await db.execute(
-        PlanReview.__table__.select().where(PlanReview.id == review_id)
-    )
-    review = result.first()
+    if not os.path.exists(review.file_path):
+        raise HTTPException(status_code=404, detail="文件不存在")
     
-    if not review:
-        raise HTTPException(status_code=404, detail="方案评审不存在")
+    # 解析文件
+    parse_result = await document_parser.parse_file(review.file_path, review.file_type)
     
-    await db.delete(review)
-    await db.commit()
+    if "error" in parse_result:
+        raise HTTPException(status_code=500, detail=parse_result["error"])
     
-    return {"success": True, "message": "方案评审已删除"}
-
-
-@router.post("/{review_id}/review")
-async def review_plan(review_id: int, db: AsyncSession = Depends(get_db)):
-    """
-    评审方案
-    5 大维度评分、问题清单、优化建议
-    """
-    # 获取方案评审
-    result = await db.execute(
-        PlanReview.__table__.select().where(PlanReview.id == review_id)
-    )
-    review = result.first()
-    
-    if not review:
-        raise HTTPException(status_code=404, detail="方案评审不存在")
-    
-    # 调用 AI 服务进行评审
-    review_result = await ai_service.review_plan(
-        content=review.title
-    )
-    
-    # 更新评审
-    review.score = review_result.get("score")
-    review.level = review_result.get("level")
-    review.dimensions = review_result.get("dimensions")
-    review.issues = review_result.get("issues")
-    review.suggestions = review_result.get("suggestions")
-    review.risks = review_result.get("risks")
+    # 更新评审记录
+    review.file_content = parse_result.get("text", "")
+    review.status = "parsed"
     
     await db.commit()
     await db.refresh(review)
     
     return {
+        "success": True,
         "review_id": review_id,
-        "review_result": review_result
+        "parse_result": parse_result
+    }
+
+
+@router.post("/{review_id}/review")
+async def review_plan(
+    review_id: int,
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    真实 AI 评审方案
+    """
+    # 获取评审记录
+    result = await db.execute(
+        PlanReview.__table__.select().where(PlanReview.id == review_id)
+    )
+    review = result.first()
+    
+    if not review:
+        raise HTTPException(status_code=404, detail="评审记录不存在")
+    
+    if not review.file_content:
+        raise HTTPException(status_code=400, detail="请先解析文件")
+    
+    # 更新状态
+    review.status = "reviewing"
+    await db.commit()
+    
+    # 调用真实 AI 评审
+    review_result = await review_engine.review_plan(
+        plan_content=review.file_content,
+        plan_type="老旧改造"
+    )
+    
+    if not review_result["success"]:
+        raise HTTPException(status_code=500, detail=review_result.get("error", "评审失败"))
+    
+    # 更新评审结果
+    result_data = review_result["review_result"]
+    review.score = result_data.get("total_score")
+    review.level = result_data.get("level")
+    review.dimensions = result_data.get("dimensions")
+    review.issues = result_data.get("issues")
+    review.suggestions = result_data.get("optimization_plan")
+    review.risks = result_data.get("risks")
+    review.status = "completed"
+    
+    await db.commit()
+    await db.refresh(review)
+    
+    return {
+        "success": True,
+        "review_id": review_id,
+        "review_result": result_data
+    }
+
+
+@router.get("/{review_id}")
+async def get_review(
+    review_id: int,
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    获取评审结果
+    """
+    result = await db.execute(
+        PlanReview.__table__.select().where(PlanReview.id == review_id)
+    )
+    review = result.first()
+    
+    if not review:
+        raise HTTPException(status_code=404, detail="评审记录不存在")
+    
+    return {
+        "success": True,
+        "review": review
     }
 
 
 @router.post("/{review_id}/optimize")
-async def optimize_plan(review_id: int, db: AsyncSession = Depends(get_db)):
+async def optimize_plan(
+    review_id: int,
+    db: AsyncSession = Depends(get_db)
+):
     """
-    优化方案
     生成优化方案
     """
-    # 获取方案评审
+    # 获取评审记录
     result = await db.execute(
         PlanReview.__table__.select().where(PlanReview.id == review_id)
     )
     review = result.first()
     
     if not review:
-        raise HTTPException(status_code=404, detail="方案评审不存在")
+        raise HTTPException(status_code=404, detail="评审记录不存在")
     
-    # 调用 AI 服务进行优化
-    optimized_content = await ai_service.optimize_report(
-        content=review.title
-    )
+    if not review.suggestions:
+        raise HTTPException(status_code=400, detail="请先完成评审")
     
-    # 更新评审
-    review.suggestions = optimized_content
-    
-    await db.commit()
-    await db.refresh(review)
+    # 生成优化方案
+    optimization_plan = {
+        "budget_adjustment": review.suggestions.get("budget_adjustment", ""),
+        "schedule_optimization": review.suggestions.get("schedule_optimization", ""),
+        "communication_mechanism": review.suggestions.get("communication_mechanism", ""),
+        "technical_improvement": review.suggestions.get("technical_improvement", "")
+    }
     
     return {
-        "review_id": review_id,
-        "optimized_content": optimized_content
+        "success": True,
+        "optimization_plan": optimization_plan
     }
 
 
-@router.post("/{review_id}/approve")
-async def approve_plan(review_id: int, db: AsyncSession = Depends(get_db)):
+@router.post("/{review_id}/export")
+async def export_review(
+    review_id: int,
+    db: AsyncSession = Depends(get_db)
+):
     """
-    评审通过
+    导出评审报告
     """
-    # 获取方案评审
+    # 获取评审记录
     result = await db.execute(
         PlanReview.__table__.select().where(PlanReview.id == review_id)
     )
     review = result.first()
     
     if not review:
-        raise HTTPException(status_code=404, detail="方案评审不存在")
+        raise HTTPException(status_code=404, detail="评审记录不存在")
     
-    # 更新状态
-    review.status = "approved"
+    # 生成 PDF 报告（实际项目中应使用报告生成库）
+    report_content = f"""
+    # 方案评审报告
     
-    await db.commit()
-    await db.refresh(review)
+    ## 基本信息
+    - 方案名称：{review.title}
+    - 评审时间：{review.created_at}
+    - 综合评分：{review.score}
+    - 评审等级：{review.level}
+    
+    ## 五维评分
+    | 维度 | 得分 | 权重 | 加权分 |
+    |------|------|------|--------|
+    | 政策合规性 | {review.dimensions.get('policy_compliance', {}).get('score', 'N/A')} | 25% | {review.dimensions.get('policy_compliance', {}).get('weighted_score', 'N/A')} |
+    | 技术可行性 | {review.dimensions.get('technical_feasibility', {}).get('score', 'N/A')} | 25% | {review.dimensions.get('technical_feasibility', {}).get('weighted_score', 'N/A')} |
+    | 经济合理性 | {review.dimensions.get('economic_rationality', {}).get('score', 'N/A')} | 20% | {review.dimensions.get('economic_rationality', {}).get('weighted_score', 'N/A')} |
+    | 社会可接受度 | {review.dimensions.get('social_acceptance', {}).get('score', 'N/A')} | 15% | {review.dimensions.get('social_acceptance', {}).get('weighted_score', 'N/A')} |
+    | 实施可操作性 | {review.dimensions.get('implementation_operability', {}).get('score', 'N/A')} | 15% | {review.dimensions.get('implementation_operability', {}).get('weighted_score', 'N/A')} |
+    
+    ## 发现问题
+    {chr(10).join([f"- {issue.get('title', '')}: {issue.get('description', '')}" for issue in review.issues or []])}
+    
+    ## 优化建议
+    {chr(10).join([f"- {suggestion}" for suggestion in review.suggestions.values() if suggestion])}
+    
+    ## 风险预警
+    {chr(10).join([f"- [{risk.get('level', '')}] {risk.get('type', '')}: {risk.get('description', '')}" for risk in review.risks or []])}
+    """
     
     return {
-        "review_id": review_id,
-        "status": "approved",
-        "message": "评审通过！方案已确认，可进入实施阶段。"
+        "success": True,
+        "report_content": report_content
     }
-
-
-@router.post("/{review_id}/reject")
-async def reject_plan(review_id: int, db: AsyncSession = Depends(get_db)):
-    """
-    评审不通过
-    """
-    # 获取方案评审
-    result = await db.execute(
-        PlanReview.__table__.select().where(PlanReview.id == review_id)
-    )
-    review = result.first()
-    
-    if not review:
-        raise HTTPException(status_code=404, detail="方案评审不存在")
-    
-    # 更新状态
-    review.status = "rejected"
-    
-    await db.commit()
-    await db.refresh(review)
-    
-    return {
-        "review_id": review_id,
-        "status": "rejected",
-        "message": "评审不通过！请根据优化建议修改后重新提交。"
-    }
-
-
-async def process_multimodal(input_data: MultimodalInput) -> dict:
-    """
-    处理多模态输入（方案评审模块）
-    
-    Args:
-        input_data: 多模态输入数据
-    
-    Returns:
-        处理结果
-    """
-    result = {
-        "module": "plan",
-        "status": "processing",
-        "message": "正在处理多模态输入..."
-    }
-    
-    # 处理文本输入
-    if input_data.text:
-        result["text_input"] = input_data.text
-    
-    # 处理图片输入
-    if input_data.image_url:
-        result["image_input"] = input_data.image_url
-    
-    # 处理文件输入
-    if input_data.file_url:
-        result["file_input"] = input_data.file_url
-    
-    # 处理音频输入
-    if input_data.audio_url:
-        result["audio_input"] = input_data.audio_url
-    
-    # 处理视频输入
-    if input_data.video_url:
-        result["video_input"] = input_data.video_url
-    
-    result["status"] = "completed"
-    result["message"] = "多模态输入处理完成"
-    
-    return result
