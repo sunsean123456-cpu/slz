@@ -79,6 +79,12 @@ app.include_router(plan.router, prefix="/api/plan", tags=["方案评审"])
 app.include_router(pricing.router, prefix="/api/pricing", tags=["收费/会员"])
 app.include_router(ai.router, prefix="/api/ai", tags=["AI 服务"])
 
+# 注册文件上传路由
+app.include_router(data.router, prefix="/api/data", tags=["社区达人"])
+app.include_router(policy.router, prefix="/api/policy", tags=["政策咨询"])
+app.include_router(health.router, prefix="/api/health", tags=["城市体检"])
+app.include_router(plan.router, prefix="/api/plan", tags=["方案评审"])
+
 
 # 健康检查
 @app.get("/health")

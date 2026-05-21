@@ -10,6 +10,7 @@ from app.models.plan_review import PlanReview
 from app.schemas.plan import PlanReviewCreate, PlanReviewResponse
 from app.services.review_engine import review_engine
 from app.services.document_parser import document_parser
+from app.services.plan_engine import plan_engine
 from app.config import settings
 import logging
 
@@ -133,7 +134,7 @@ async def review_plan(
     await db.commit()
     
     # 调用真实 AI 评审
-    review_result = await review_engine.review_plan(
+    review_result = await plan_engine.review_plan(
         plan_content=review.file_content,
         plan_type="老旧改造"
     )

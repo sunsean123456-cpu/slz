@@ -1,55 +1,100 @@
 """
-政策咨询路由
+政策咨询路由 - 真实合规审查、判例查询
 """
-import json
-from fastapi import APIRouter, Depends, HTTPException, status
+import os
+import uuid
+from fastapi import APIRouter, UploadFile, File, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
 from app.database import get_db
 from app.models.policy import Policy
 from app.schemas.policy import PolicyResponse
-from app.schemas.multimodal import MultimodalInput
-from app.services.ai_service import ai_service
+from app.services.policy_engine import policy_engine
+from app.services.document_parser import document_parser
+from app.config import settings
 import logging
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
+# 上传目录
+UPLOAD_DIR = settings.UPLOAD_DIR
+os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-@router.post("/", response_model=PolicyResponse)
-async def create_policy(
-    title: str,
-    content: str = None,
-    level: str = None,
-    status: str = "active",
-    tags: list = None,
-    source: str = None,
+
+@router.post("/upload")
+async def upload_file(
+    file: UploadFile = File(...),
     db: AsyncSession = Depends(get_db)
 ):
     """
-    创建政策法规
+    文件上传接口
+    支持：PDF/Word/图片
     """
     try:
-        policy = Policy(
-            title=title,
-            content=content,
-            level=level,
-            status=status,
-            tags=tags,
-            source=source
-        )
-        db.add(policy)
-        await db.commit()
-        await db.refresh(policy)
+        # 生成文件名
+        file_ext = file.filename.split(".")[-1] if "." in file.filename else ""
+        unique_name = f"{uuid.uuid4().hex}.{file_ext}"
+        file_path = os.path.join(UPLOAD_DIR, unique_name)
         
-        return policy
+        # 保存文件
+        content = await file.read()
+        with open(file_path, "wb") as f:
+            f.write(content)
+        
+        # 检测文件类型
+        file_type = document_parser.detect_file_type(file.filename)
+        
+        return {
+            "success": True,
+            "file_name": unique_name,
+            "file_type": file_type
+        }
     except Exception as e:
-        logger.error(f"创建政策法规失败：{str(e)}")
+        logger.error(f"文件上传失败：{str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.get("/", response_model=list[PolicyResponse])
+@router.post("/compliance")
+async def compliance_review(
+    content: str,
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    真实合规审查
+    """
+    review_result = await policy_engine.compliance_review(content)
+    
+    return review_result
+
+
+@router.post("/cases")
+async def search_cases(
+    query: str,
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    真实判例查询
+    """
+    cases_result = await policy_engine.search_cases(query)
+    
+    return cases_result
+
+
+@router.post("/opinion")
+async def generate_opinion(
+    content: str,
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    生成书面咨询意见
+    """
+    opinion_result = await policy_engine.generate_opinion(content)
+    
+    return opinion_result
+
+
+@router.get("/policies")
 async def list_policies(
     level: str = None,
     status: str = None,
@@ -61,6 +106,8 @@ async def list_policies(
     """
     查询政策法规列表
     """
+    from sqlalchemy import select
+    
     query = select(Policy)
     
     if level:
@@ -75,104 +122,18 @@ async def list_policies(
     result = await db.execute(query)
     policies = result.scalars().all()
     
-    return policies
-
-
-@router.get("/{policy_id}", response_model=PolicyResponse)
-async def get_policy(policy_id: int, db: AsyncSession = Depends(get_db)):
-    """获取政策法规详情"""
-    result = await db.execute(
-        Policy.__table__.select().where(Policy.id == policy_id)
-    )
-    policy = result.first()
-    
-    if not policy:
-        raise HTTPException(status_code=404, detail="政策法规不存在")
-    
-    return policy
-
-
-@router.delete("/{policy_id}")
-async def delete_policy(policy_id: int, db: AsyncSession = Depends(get_db)):
-    """删除政策法规"""
-    result = await db.execute(
-        Policy.__table__.select().where(Policy.id == policy_id)
-    )
-    policy = result.first()
-    
-    if not policy:
-        raise HTTPException(status_code=404, detail="政策法规不存在")
-    
-    await db.delete(policy)
-    await db.commit()
-    
-    return {"success": True, "message": "政策法规已删除"}
-
-
-@router.post("/analyze")
-async def analyze_compliance(
-    content: str,
-    db: AsyncSession = Depends(get_db)
-):
-    """
-    合规分析
-    分析内容是否符合政策法规
-    """
-    # 获取所有现行政策法规
-    result = await db.execute(
-        select(Policy).where(Policy.status == "active")
-    )
-    policies = result.scalars().all()
-    
-    # 调用 AI 服务进行合规分析
-    analysis_result = await ai_service.analyze_compliance(
-        content=content,
-        policies=[p.__dict__ for p in policies]
-    )
-    
     return {
-        "content": content,
-        "analysis": analysis_result
+        "success": True,
+        "policies": [
+            {
+                "id": policy.id,
+                "title": policy.title,
+                "content": policy.content,
+                "level": policy.level,
+                "status": policy.status,
+                "tags": policy.tags,
+                "source": policy.source
+            }
+            for policy in policies
+        ]
     }
-
-
-async def process_multimodal(input_data: MultimodalInput) -> dict:
-    """
-    处理多模态输入（政策咨询模块）
-    
-    Args:
-        input_data: 多模态输入数据
-    
-    Returns:
-        处理结果
-    """
-    result = {
-        "module": "policy",
-        "status": "processing",
-        "message": "正在处理多模态输入..."
-    }
-    
-    # 处理文本输入
-    if input_data.text:
-        result["text_input"] = input_data.text
-    
-    # 处理图片输入
-    if input_data.image_url:
-        result["image_input"] = input_data.image_url
-    
-    # 处理文件输入
-    if input_data.file_url:
-        result["file_input"] = input_data.file_url
-    
-    # 处理音频输入
-    if input_data.audio_url:
-        result["audio_input"] = input_data.audio_url
-    
-    # 处理视频输入
-    if input_data.video_url:
-        result["video_input"] = input_data.video_url
-    
-    result["status"] = "completed"
-    result["message"] = "多模态输入处理完成"
-    
-    return result
